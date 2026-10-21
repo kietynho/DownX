@@ -1,3 +1,4 @@
 fastapi
 yt-dlp
 imageio-ffmpeg
+uvicorn[standard]
