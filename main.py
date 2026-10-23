@@ -34,7 +34,7 @@ HTML_CONTENT = """
         .status { margin-top: 1rem; text-align: center; font-size: 0.875rem; color: #94a3b8; }
         .spinner { display: none; margin: 0 auto 1rem; width: 2rem; height: 2rem; border: 3px solid #334155; border-top-color: #3b82f6; border-radius: 50%; animation: spin 1s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
-        .error { color: #ef4444; margin-top: 1rem; text-align: center; font-size: 0.875rem; word-wrap: break-word; }
+        .error { color: #ef4444; margin-top: 1rem; text-align: left; font-size: 0.8rem; word-wrap: break-word; white-space: pre-wrap; background: #2a1a1a; padding: 10px; border-radius: 5px; max-height: 150px; overflow-y: auto; }
     </style>
 </head>
 <body>
@@ -50,7 +50,7 @@ HTML_CONTENT = """
         <button id="btn" onclick="download()">Tải Xuống</button>
         <div class="spinner" id="spinner"></div>
         <div class="status" id="status"></div>
-        <div class="error" id="error"></div>
+        <div class="error" id="error" style="display: none;"></div>
     </div>
 
     <script>
@@ -63,6 +63,7 @@ HTML_CONTENT = """
             const error = document.getElementById('error');
 
             if (!url) {
+                error.style.display = "block";
                 error.textContent = "Vui lòng nhập URL.";
                 return;
             }
@@ -70,6 +71,7 @@ HTML_CONTENT = """
             btn.disabled = true;
             spinner.style.display = 'block';
             status.textContent = "Đang xử lý... Quá trình này có thể mất vài phút.";
+            error.style.display = "none";
             error.textContent = "";
 
             try {
@@ -80,15 +82,13 @@ HTML_CONTENT = """
                 });
 
                 if (!res.ok) {
-                    // Cố gắng lấy lỗi chi tiết từ JSON
                     let errMsg = 'Tải thất bại. Vui lòng thử lại.';
                     try {
                         const errData = await res.json();
                         errMsg = errData.detail || errMsg;
                     } catch (e) {
-                        // Nếu không phải JSON (vd: lỗi 502 từ Render), hiển thị text
-                        const textData = await res.text();
-                        if (textData) errMsg = textData.substring(0, 100);
+                        // Bắt lỗi 502 Bad Gateway của Render
+                        errMsg = `Lỗi Server (${res.status}): ${res.statusText}`;
                     }
                     throw new Error(errMsg);
                 }
@@ -111,6 +111,7 @@ HTML_CONTENT = """
                 
                 status.textContent = "Hoàn tất! Kiểm tra thư mục tải xuống của bạn.";
             } catch (err) {
+                error.style.display = "block";
                 error.textContent = err.message;
                 status.textContent = "";
             } finally {
@@ -157,7 +158,7 @@ async def download(request: Request, background_tasks: BackgroundTasks):
         "ffmpeg_location": FFMPEG_PATH,
         "noplaylist": True,
         "restrictfilenames": True,
-        "impersonate": "chrome", # Giả lập TLS Chrome tránh WAF
+        "impersonate": "chrome",
         "extractor_args": {
             "tiktok": {
                 "api_hostname": ["api16-normal-c-useast1a.tiktokv.com"]
@@ -177,9 +178,8 @@ async def download(request: Request, background_tasks: BackgroundTasks):
             "preferredquality": "192",
         }]
     else:
-        # Dùng fallback cực mạnh cho MP4: Ưu tiên H264/AAC, nếu không có thì lấy cái tốt nhất
-        ydl_opts["format"] = "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
-        ydl_opts["merge_output_format"] = "mp4"
+        # Tải file MP4 tốt nhất (thường TikTok chỉ có single file)
+        ydl_opts["format"] = "b[ext=mp4]/b"
     
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -189,10 +189,9 @@ async def download(request: Request, background_tasks: BackgroundTasks):
             if fmt == "mp3":
                 filename = os.path.splitext(filename)[0] + ".mp3"
             else:
-                filename = os.path.splitext(filename)[0] + ".mp4"
                 if not os.path.exists(filename):
                     base = os.path.splitext(filename)[0]
-                    for ext in [".mkv", ".webm"]:
+                    for ext in [".mp4", ".mkv", ".webm"]:
                         if os.path.exists(base + ext):
                             filename = base + ext
                             break
@@ -200,26 +199,24 @@ async def download(request: Request, background_tasks: BackgroundTasks):
             if not os.path.exists(filename):
                 raise Exception("File not found after download")
 
-            # Xử lý transcode H264 cho video
+            # Chỉ transcode nếu video không phải H264 (ví dụ HEVC của iPhone)
             if fmt == "mp4":
-                base = os.path.splitext(filename)[0]
-                out_h264 = base + "_h264.mp4"
-                
-                # Render Free CPU rất yếu, dùng ultrafast và cố gắng copy stream (-c:v copy)
-                # Nếu file đã là H264 thì copy, nếu không thì transcode với ultrafast
-                cmd = [
-                    FFMPEG_PATH, "-y", "-i", filename,
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", # ultrafast để không bị timeout
-                    "-c:a", "aac", "-b:a", "128k", "-ac", "2",
-                    "-movflags", "+faststart", "-pix_fmt", "yuv420p",
-                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-                    out_h264
-                ]
-                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-                
-                if os.path.exists(filename) and filename != out_h264:
-                    os.remove(filename)
-                filename = out_h264
+                vcodec = info.get('vcodec', '')
+                if 'avc1' not in vcodec and 'h264' not in vcodec.lower():
+                    base = os.path.splitext(filename)[0]
+                    out_h264 = base + "_h264.mp4"
+                    cmd = [
+                        FFMPEG_PATH, "-y", "-i", filename,
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+                        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+                        "-movflags", "+faststart", "-pix_fmt", "yuv420p",
+                        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                        out_h264
+                    ]
+                    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+                    if os.path.exists(filename) and filename != out_h264:
+                        os.remove(filename)
+                    filename = out_h264
 
             ext = os.path.splitext(filename)[1]
             raw_title = info.get("title", "download")
@@ -238,13 +235,15 @@ async def download(request: Request, background_tasks: BackgroundTasks):
             )
 
     except yt_dlp.utils.DownloadError as e:
-        # Trả về đúng lỗi của yt-dlp cho Frontend hiển thị
-        clean_err = str(e).replace("ERROR: ", "").replace("[TikTok] ", "")
-        raise HTTPException(status_code=400, detail=clean_err)
+        raise HTTPException(status_code=400, detail=f"YT-DLP: {str(e)}")
     except subprocess.CalledProcessError:
-        raise HTTPException(status_code=500, detail="FFmpeg transcode failed. Video có thể quá dài hoặc bị lỗi.")
+        raise HTTPException(status_code=500, detail="FFmpeg transcode failed. Video bị lỗi.")
     except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Xử lý quá thời gian (120s). Vui lòng thử video ngắn hơn.")
+        raise HTTPException(status_code=500, detail="FFmpeg quá thời gian (120s). Render Free CPU yếu.")
     except Exception as e:
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Lỗi hệ thống: {str(e)}")
+        # Bắt toàn bộ lỗi và in ra màn hình Frontend (do không xem được log Render)
+        error_trace = traceback.format_exc()
+        print(error_trace)
+        # Cắt lấy 3 dòng cuối của traceback để hiển thị
+        short_err = "\n".join(error_trace.strip().split("\n")[-3:])
+        raise HTTPException(status_code=500, detail=f"CHI TIẾT LỖI:\n{short_err}")
