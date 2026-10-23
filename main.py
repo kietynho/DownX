@@ -101,6 +101,7 @@ HTML_CONTENT = """
                 
                 status.textContent = "Hoàn tất! Kiểm tra thư mục tải xuống của bạn.";
             } catch (err) {
+                // Nếu lỗi không phải do fetch mà do logic, hiển thị thông báo cụ thể
                 error.textContent = err.message;
                 status.textContent = "";
             } finally {
@@ -131,8 +132,17 @@ async def download(request: Request, background_tasks: BackgroundTasks):
         data = await request.json()
         url = data.get("url")
         fmt = data.get("format", "mp4")
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    except yt_dlp.utils.DownloadError as e:
+        # Trả về đúng thông báo lỗi của yt-dlp thay vì lỗi chung chung
+        raise HTTPException(status_code=400, detail=str(e).replace("ERROR: ", ""))
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail="FFmpeg transcode failed: Kiểm tra lại file tải về có bị lỗi không.")
+    except Exception as e:
+        # Bắt mọi lỗi còn lại (crash code, lỗi thư viện, v.v.)
+        import traceback
+        error_detail = traceback.format_exc()
+        print(error_detail) # Render log (nếu có)
+        raise HTTPException(status_code=500, detail=f"Lỗi hệ thống: {str(e)}")
 
     if not url:
         raise HTTPException(status_code=400, detail="Missing URL")
