@@ -148,6 +148,14 @@ async def download(request: Request, background_tasks: BackgroundTasks):
         "ffmpeg_location": FFMPEG_PATH,
         "noplaylist": True,
         "restrictfilenames": True,
+        # --- THÊM 2 DÒNG NÀY ---
+        "impersonate": "chrome", # Vượt Cloudflare TLS check
+        "extractor_args": {
+            "tiktok": {
+                "api_hostname": ["api16-normal-c-useast1a.tiktokv.com"]
+            }
+        }
+        # ------------------------
     }
     
     if fmt == "mp3":
