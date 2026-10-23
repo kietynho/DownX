@@ -6,6 +6,7 @@ import os
 import subprocess
 import uuid
 import urllib.parse
+import traceback
 
 app = FastAPI()
 FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
@@ -33,7 +34,7 @@ HTML_CONTENT = """
         .status { margin-top: 1rem; text-align: center; font-size: 0.875rem; color: #94a3b8; }
         .spinner { display: none; margin: 0 auto 1rem; width: 2rem; height: 2rem; border: 3px solid #334155; border-top-color: #3b82f6; border-radius: 50%; animation: spin 1s linear infinite; }
         @keyframes spin { to { transform: rotate(360deg); } }
-        .error { color: #ef4444; margin-top: 1rem; text-align: center; font-size: 0.875rem; }
+        .error { color: #ef4444; margin-top: 1rem; text-align: center; font-size: 0.875rem; word-wrap: break-word; }
     </style>
 </head>
 <body>
@@ -79,8 +80,17 @@ HTML_CONTENT = """
                 });
 
                 if (!res.ok) {
-                    const errData = await res.json();
-                    throw new Error(errData.detail || 'Tải thất bại');
+                    // Cố gắng lấy lỗi chi tiết từ JSON
+                    let errMsg = 'Tải thất bại. Vui lòng thử lại.';
+                    try {
+                        const errData = await res.json();
+                        errMsg = errData.detail || errMsg;
+                    } catch (e) {
+                        // Nếu không phải JSON (vd: lỗi 502 từ Render), hiển thị text
+                        const textData = await res.text();
+                        if (textData) errMsg = textData.substring(0, 100);
+                    }
+                    throw new Error(errMsg);
                 }
 
                 const blob = await res.blob();
@@ -101,7 +111,6 @@ HTML_CONTENT = """
                 
                 status.textContent = "Hoàn tất! Kiểm tra thư mục tải xuống của bạn.";
             } catch (err) {
-                // Nếu lỗi không phải do fetch mà do logic, hiển thị thông báo cụ thể
                 error.textContent = err.message;
                 status.textContent = "";
             } finally {
@@ -132,22 +141,12 @@ async def download(request: Request, background_tasks: BackgroundTasks):
         data = await request.json()
         url = data.get("url")
         fmt = data.get("format", "mp4")
-    except yt_dlp.utils.DownloadError as e:
-        # Trả về đúng thông báo lỗi của yt-dlp thay vì lỗi chung chung
-        raise HTTPException(status_code=400, detail=str(e).replace("ERROR: ", ""))
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail="FFmpeg transcode failed: Kiểm tra lại file tải về có bị lỗi không.")
-    except Exception as e:
-        # Bắt mọi lỗi còn lại (crash code, lỗi thư viện, v.v.)
-        import traceback
-        error_detail = traceback.format_exc()
-        print(error_detail) # Render log (nếu có)
-        raise HTTPException(status_code=500, detail=f"Lỗi hệ thống: {str(e)}")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     if not url:
         raise HTTPException(status_code=400, detail="Missing URL")
 
-    # Thư mục /tmp là thư mục duy nhất được phép ghi trên Render Web Service
     out_dir = "/tmp"
     unique_id = str(uuid.uuid4())[:8]
     
@@ -158,15 +157,17 @@ async def download(request: Request, background_tasks: BackgroundTasks):
         "ffmpeg_location": FFMPEG_PATH,
         "noplaylist": True,
         "restrictfilenames": True,
-        # --- THÊM 2 DÒNG NÀY ---
-        "impersonate": "chrome", # Vượt Cloudflare TLS check
+        "impersonate": "chrome", # Giả lập TLS Chrome tránh WAF
         "extractor_args": {
             "tiktok": {
                 "api_hostname": ["api16-normal-c-useast1a.tiktokv.com"]
             }
         }
-        # ------------------------
     }
+
+    # Tự động nhận diện cookies.txt nếu bạn upload lên Render
+    if os.path.exists("cookies.txt"):
+        ydl_opts["cookiefile"] = "cookies.txt"
     
     if fmt == "mp3":
         ydl_opts["format"] = "bestaudio/best"
@@ -176,7 +177,8 @@ async def download(request: Request, background_tasks: BackgroundTasks):
             "preferredquality": "192",
         }]
     else:
-        ydl_opts["format"] = "bestvideo[vcodec^=avc1]+bestaudio/bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        # Dùng fallback cực mạnh cho MP4: Ưu tiên H264/AAC, nếu không có thì lấy cái tốt nhất
+        ydl_opts["format"] = "bv*[vcodec^=avc1]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b"
         ydl_opts["merge_output_format"] = "mp4"
     
     try:
@@ -198,19 +200,23 @@ async def download(request: Request, background_tasks: BackgroundTasks):
             if not os.path.exists(filename):
                 raise Exception("File not found after download")
 
-            # Xử lý transcode H264 nếu là video
+            # Xử lý transcode H264 cho video
             if fmt == "mp4":
                 base = os.path.splitext(filename)[0]
                 out_h264 = base + "_h264.mp4"
+                
+                # Render Free CPU rất yếu, dùng ultrafast và cố gắng copy stream (-c:v copy)
+                # Nếu file đã là H264 thì copy, nếu không thì transcode với ultrafast
                 cmd = [
                     FFMPEG_PATH, "-y", "-i", filename,
-                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26", # ultrafast để không bị timeout
                     "-c:a", "aac", "-b:a", "128k", "-ac", "2",
                     "-movflags", "+faststart", "-pix_fmt", "yuv420p",
                     "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                     out_h264
                 ]
-                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+                
                 if os.path.exists(filename) and filename != out_h264:
                     os.remove(filename)
                 filename = out_h264
@@ -223,7 +229,6 @@ async def download(request: Request, background_tasks: BackgroundTasks):
             download_name = safe_title + ext
             encoded_name = urllib.parse.quote(download_name)
 
-            # Xoá file sau khi response đã gửi xong
             background_tasks.add_task(cleanup_files, filename)
 
             return FileResponse(
@@ -233,8 +238,13 @@ async def download(request: Request, background_tasks: BackgroundTasks):
             )
 
     except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=400, detail=f"Download failed: {str(e)}")
+        # Trả về đúng lỗi của yt-dlp cho Frontend hiển thị
+        clean_err = str(e).replace("ERROR: ", "").replace("[TikTok] ", "")
+        raise HTTPException(status_code=400, detail=clean_err)
     except subprocess.CalledProcessError:
-        raise HTTPException(status_code=500, detail="FFmpeg transcode failed")
+        raise HTTPException(status_code=500, detail="FFmpeg transcode failed. Video có thể quá dài hoặc bị lỗi.")
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=500, detail="Xử lý quá thời gian (120s). Vui lòng thử video ngắn hơn.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Lỗi hệ thống: {str(e)}")
