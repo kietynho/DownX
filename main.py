@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, HTMLResponse
+from yt_dlp.networking.impersonate import ImpersonateTarget
 import yt_dlp
 import imageio_ffmpeg
 import os
@@ -158,7 +159,8 @@ async def download(request: Request, background_tasks: BackgroundTasks):
         "ffmpeg_location": FFMPEG_PATH,
         "noplaylist": True,
         "restrictfilenames": True,
-        "impersonate": "chrome",
+        # SỬA DÒNG DƯỚI ĐÂY:
+        "impersonate": ImpersonateTarget.from_str("chrome"),
         "extractor_args": {
             "tiktok": {
                 "api_hostname": ["api16-normal-c-useast1a.tiktokv.com"]
